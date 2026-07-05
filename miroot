@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# 最小構成のDockerイメージを作るための補助関数群。
+# バイナリ、その実行時依存、シンボリックリンク連鎖、パッケージの
+# copyrightを/outへコピーする。想定外の状態は明示的に失敗させ、
+# `set -e`が効きにくい文脈でも失敗が伝播するよう`|| return 1`を徹底する。
+
+set -euo pipefail
+
+# $1の親ディレクトリが/out配下に存在するようにし、メタデータも複製する。
+ensure_parent_dirs_copied() {
+  local path="$1" cur="" p
+  IFS=/ read -r -a parts <<<"$path"
+  for p in "${parts[@]}"; do
+    [ -z "$p" ] && continue
+    if [ -n "$cur" ] && [ ! -d "/out${cur}" ]; then
+      copy_dir_with_symlink_chain "$cur" || return 1
+    fi
+    cur="$cur/$p"
+  done
+}
+
+# $1から始まるシンボリックリンク連鎖を解決し、各リンクを/outへコピーする。
+# 最終的な非シンボリックリンクのパスを出力する。
+resolve_symlink_chain_target() {
+  local cur="$1" nxt depth=0 src_target out_target
+  while [[ -L $cur ]]; do
+    ((++depth > 64)) && {
+      printf 'シンボリックリンクの連鎖が深すぎます: %s\n' "$1" >&2
+      return 1
+    }
+    ensure_parent_dirs_copied "$cur" || return 1
+    src_target="$(readlink "$cur")" || return 1
+    if [[ -L "/out${cur}" ]]; then
+      out_target="$(readlink "/out${cur}")" || return 1
+      if [[ $out_target != "$src_target" ]]; then
+        printf '%sのシンボリックリンク先が一致しません: 期待値=%s 実際=%s\n' \
+          "/out${cur}" "$src_target" "$out_target" >&2
+        return 1
+      fi
+    elif [[ -e "/out${cur}" ]]; then
+      printf 'パスは存在しますがシンボリックリンクではありません: %s\n' "/out${cur}" >&2
+      return 1
+    else
+      cp -a "$cur" "/out${cur}" || return 1
+    fi
+    nxt="$src_target"
+    [[ $nxt == /* ]] || nxt="$(dirname "$cur")/$nxt"
+    cur="$nxt"
+  done
+  if [[ ! -e $cur ]]; then
+    printf 'シンボリックリンクの最終参照先が存在しません: %s\n' "$cur" >&2
+    return 1
+  fi
+  ensure_parent_dirs_copied "$cur" || return 1
+  printf '%s\n' "$cur"
+}
+
+# $1の実体を(シンボリックリンク連鎖をたどって)/outへコピーする。
+# 実体が通常ファイルでもディレクトリでも扱える。
+# /outに同じ種別でメタデータ(%a:%u:%g)が一致するパスが既にある場合は成功とみなす。
+copy_path_with_symlink_chain() {
+  local cur="$1" src_meta dst_meta
+  cur="$(resolve_symlink_chain_target "$cur")" || return 1
+  if [[ -d $cur ]]; then
+    if [[ -L "/out${cur}" ]]; then
+      printf 'copy_path_with_symlink_chain: パスがシンボリックリンクです: %s\n' "/out${cur}" >&2
+      return 1
+    fi
+    if [[ -e "/out${cur}" ]]; then
+      if [[ ! -d "/out${cur}" ]]; then
+        printf 'copy_path_with_symlink_chain: 既存パスはディレクトリではありません: %s\n' "/out${cur}" >&2
+        return 1
+      fi
+      src_meta="$(stat -c '%a:%u:%g' "$cur")" || return 1
+      dst_meta="$(stat -c '%a:%u:%g' "/out${cur}")" || return 1
+      if [[ $src_meta != "$dst_meta" ]]; then
+        printf 'copy_path_with_symlink_chain: ディレクトリのメタデータが一致しません: %s (src=%s dst=%s)\n' "$cur" "$src_meta" "$dst_meta" >&2
+        return 1
+      fi
+      return 0
+    fi
+    cp -a "$cur" "/out${cur}" || return 1
+  elif [[ -f $cur ]]; then
+    if [[ -L "/out${cur}" ]]; then
+      printf 'copy_path_with_symlink_chain: パスがシンボリックリンクです: %s\n' "/out${cur}" >&2
+      return 1
+    fi
+    if [[ -e "/out${cur}" ]]; then
+      if [[ ! -f "/out${cur}" ]]; then
+        printf 'copy_path_with_symlink_chain: 既存パスは通常ファイルではありません: %s\n' "/out${cur}" >&2
+        return 1
+      fi
+      src_meta="$(stat -c '%a:%u:%g' "$cur")" || return 1
+      dst_meta="$(stat -c '%a:%u:%g' "/out${cur}")" || return 1
+      if [[ $src_meta != "$dst_meta" ]]; then
+        printf 'copy_path_with_symlink_chain: ファイルのメタデータが一致しません: %s (src=%s dst=%s)\n' "$cur" "$src_meta" "$dst_meta" >&2
+        return 1
+      fi
+      return 0
+    fi
+    cp -a "$cur" "/out${cur}" || return 1
+  else
+    printf 'copy_path_with_symlink_chain: 未対応のパス種別です: %s\n' "$cur" >&2
+    return 1
+  fi
+}
+
+# ディレクトリを(シンボリックリンク連鎖をたどって)/outへコピーする。
+# コピー先に両立しない非ディレクトリが既にある場合は失敗する。
+# この関数はディレクトリエントリとメタデータのみを作成し、ディレクトリの
+# 内容物はコピーしない。各ファイルは copy_path_with_symlink_chain などで
+# 個別にコピーされることを前提としている。
+copy_dir_with_symlink_chain() {
+  local cur="$1"
+  cur="$(resolve_symlink_chain_target "$cur")" || return 1
+  if [[ ! -d $cur ]]; then
+    printf 'copy_dir_with_symlink_chain: ディレクトリではありません: %s\n' "$cur" >&2
+    return 1
+  fi
+  if [[ -L "/out${cur}" ]]; then
+    printf 'copy_dir_with_symlink_chain: パスがシンボリックリンクです。ディレクトリを期待していました: %s\n' "/out${cur}" >&2
+    return 1
+  elif [[ -e "/out${cur}" && ! -d "/out${cur}" ]]; then
+    printf 'copy_dir_with_symlink_chain: パスは存在しますがディレクトリではありません: %s\n' "/out${cur}" >&2
+    return 1
+  fi
+  [[ -d "/out${cur}" ]] || mkdir "/out${cur}" || return 1
+  # chown/chmod/touch は root 権限が必要。非 root 環境では失敗するが仕様。
+  chmod --reference="$cur" "/out${cur}" || return 1
+  chown --reference="$cur" "/out${cur}" || return 1
+  touch --reference="$cur" "/out${cur}" || return 1
+}
+
+# /out配下にディレクトリを作成し、最も近い既存祖先のメタデータを複製する。
+create_dir_with_existing_ancestor() {
+  local cur="$1"
+  while [ -n "$cur" ]; do
+    if [ -d "$cur" ]; then
+      copy_dir_with_symlink_chain "$cur" || return 1
+      break
+    fi
+    if [ -L "$cur" ]; then
+      ensure_parent_dirs_copied "$cur" || return 1
+      resolve_symlink_chain_target "$cur" >/dev/null || return 1
+      break
+    fi
+    cur="${cur%/*}"
+  done
+  mkdir -p "/out${1}" || return 1
+}
+
+# $1に対応するDebianパッケージのcopyrightを/outへコピーする。
+# dpkg -Sの終了ステータスが成功した場合のみ所有者行として扱う。
+# 所有者行が取得できない場合は実体パスで1回だけフォールバックする。
+# それでも取得できない場合やcopyrightファイルが存在しない場合は
+# 診断メッセージを出力して失敗する。
+copy_package_copyright_for_path() {
+  local path="$1" dpkg_output dpkg_status=0 pkg copyright line resolved_lookup
+  dpkg_output="$(LC_ALL=C dpkg -S "$path" 2>&1)" || dpkg_status=$?
+  pkg=""
+  if [ "$dpkg_status" -eq 0 ]; then
+    while IFS= read -r line; do
+      case "$line" in
+      diversion\ *) continue ;;
+      *:*)
+        pkg="${line%%:*}"
+        break
+        ;;
+      *)
+        printf '想定外のdpkg -S出力形式です: %s: %s\n' "$path" "$line" >&2
+        return 1
+        ;;
+      esac
+    done <<<"$dpkg_output"
+  else
+    case "$dpkg_output" in
+    *"no path found"*) ;;
+    *)
+      printf 'dpkg -Sに失敗しました: %s: %s\n' "$path" "$dpkg_output" >&2
+      return 1
+      ;;
+    esac
+  fi
+  if [ -z "$pkg" ]; then
+    resolved_lookup="$(realpath -e "$path" 2>/dev/null)" || resolved_lookup=""
+    if [ -n "$resolved_lookup" ] && [ "$resolved_lookup" != "$path" ]; then
+      dpkg_status=0
+      dpkg_output="$(LC_ALL=C dpkg -S "$resolved_lookup" 2>&1)" || dpkg_status=$?
+      if [ "$dpkg_status" -eq 0 ]; then
+        while IFS= read -r line; do
+          case "$line" in
+          diversion\ *) continue ;;
+          *:*)
+            pkg="${line%%:*}"
+            break
+            ;;
+          *)
+            printf '想定外のdpkg -S出力形式です: %s: %s\n' "$resolved_lookup" "$line" >&2
+            return 1
+            ;;
+          esac
+        done <<<"$dpkg_output"
+      fi
+    fi
+  fi
+  [ -n "$pkg" ] || {
+    printf '所有パッケージを特定できませんでした: %s\n' "$path" >&2
+    return 1
+  }
+  copyright="/usr/share/doc/${pkg}/copyright"
+  if [ ! -f "$copyright" ]; then
+    printf 'copyrightが見つかりません: package=%s path=%s expected=%s\n' "$pkg" "$path" "$copyright" >&2
+    return 1
+  fi
+  copy_path_with_symlink_chain "$copyright" || return 1
+}
+
+# バイナリ本体と、それが必要とする全ライブラリを/outへコピーする。
+copy_binary_dependencies() {
+  local target bin org_p p deps
+  if ! command -v lddtree >/dev/null 2>&1; then
+    printf 'lddtreeが見つかりません。pax-utilsをインストールしてください。\n' >&2
+    return 1
+  fi
+  # 実体パスは比較用にだけ使う。
+  target="$(realpath -e "$1")" || return 1
+  # 元の経路はmerged-usr上の登録パスを保ったまま扱う。
+  bin="$(realpath -s "$1")" || return 1
+  # プロセス置換を避け、lddtree/awk/sortの失敗を確実に拾う。
+  deps="$(lddtree -l "$bin" | awk '/^\//{print}' | sort -u)" || return 1
+  while IFS= read -r p; do
+    copy_path_with_symlink_chain "$p" || return 1
+    org_p="$(realpath -e "$p")" || return 1
+    if [[ $org_p != "$target" && $org_p != /usr/local/* ]]; then
+      copy_package_copyright_for_path "$p" || return 1
+    fi
+  done <<<"$deps"
+  org_p="$(realpath -e "$bin")" || return 1
+  if [[ $org_p != /usr/local/* ]]; then
+    copy_package_copyright_for_path "$bin" || return 1
+  fi
+}
